@@ -13,6 +13,7 @@ package olm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -84,20 +85,37 @@ func OperatorExists(
 	return nil, ErrOperatorNotInstalled
 }
 
-// SubscriptionExists checks whether an operator installation with the given
-// name exists anywhere on the cluster. It supports both OLMv0 Subscriptions
-// and OLMv1 ClusterExtensions.
+// SubscriptionExists checks for an OLMv0 Subscription with the given
+// metadata.name in any namespace. It does not check OLMv1 ClusterExtensions.
+// When the Subscription API is unavailable, the returned error satisfies
+// [meta.IsNoMatchError].
+//
+// Deprecated: Use OperatorPackageRequested for package-based detection across
+// OLMv0 and OLMv1. Pass the operator package name, which may differ from the
+// Subscription resource name. SubscriptionExists only checks OLMv0 Subscriptions.
+func SubscriptionExists(ctx context.Context, cli client.Reader, name string) (bool, error) {
+	return resourceExists(ctx, cli, subscriptionGVK, name, "metadata", "name")
+}
+
+// OperatorPackageRequested reports whether the given operator package is
+// requested on the cluster, by an OLMv0 Subscription (spec.name) or an OLMv1
+// ClusterExtension (spec.source.catalog.packageName). A Subscription match
+// returns immediately; otherwise, ClusterExtensions are checked. Resource names
+// are ignored. It checks resource existence only, not installation success or
+// operator readiness. A match returns true with no error, even if the other
+// API lookup failed.
 //
 // Requires OLM. An API-not-found error from either OLM version is ignored when
 // the other version's API is available. When neither API is available, the
 // returned error satisfies [meta.IsNoMatchError].
-func SubscriptionExists(ctx context.Context, cli client.Reader, name string) (bool, error) {
-	subscriptionExists, subscriptionErr := resourceExists(ctx, cli, subscriptionGVK, name)
+func OperatorPackageRequested(ctx context.Context, cli client.Reader, packageName string) (bool, error) {
+	subscriptionExists, subscriptionErr := resourceExists(ctx, cli, subscriptionGVK, packageName, "spec", "name")
 	if subscriptionExists {
 		return true, nil
 	}
 
-	clusterExtensionExists, clusterExtensionErr := resourceExists(ctx, cli, clusterExtensionGVK, name)
+	clusterExtensionExists, clusterExtensionErr := resourceExists(
+		ctx, cli, clusterExtensionGVK, packageName, "spec", "source", "catalog", "packageName")
 	if clusterExtensionExists {
 		return true, nil
 	}
@@ -118,7 +136,7 @@ func SubscriptionExists(ctx context.Context, cli client.Reader, name string) (bo
 }
 
 func resourceExists(
-	ctx context.Context, cli client.Reader, gvk schema.GroupVersionKind, name string,
+	ctx context.Context, cli client.Reader, gvk schema.GroupVersionKind, value string, fields ...string,
 ) (bool, error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(gvk)
@@ -129,7 +147,12 @@ func resourceExists(
 	}
 
 	for _, item := range list.Items {
-		if item.GetName() == name {
+		actual, found, err := unstructured.NestedString(item.Object, fields...)
+		if err != nil {
+			return false, fmt.Errorf("read %s on %s %s: %w", strings.Join(fields, "."), gvk.Kind, item.GetName(), err)
+		}
+
+		if found && actual == value {
 			return true, nil
 		}
 	}
